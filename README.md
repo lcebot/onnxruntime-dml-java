@@ -20,7 +20,7 @@ VERSIONS.txt                       ONNX Runtime and DirectML versions
 SHA256SUMS.txt                     SHA-256 of every file above
 ```
 
-The SHA-256 of the zip is in the release notes. A published release is never replaced, so the hash can be pinned.
+The SHA-256 of the zip is in the release notes, and `SHA256SUMS.txt` inside lets a download be checked after unpacking. A published release is never replaced, so a version always means the same files.
 
 ## Usage
 
