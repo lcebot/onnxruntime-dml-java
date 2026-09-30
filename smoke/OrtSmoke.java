@@ -41,8 +41,7 @@ public class OrtSmoke {
         }
         OrtEnvironment env = OrtEnvironment.getEnvironment();
         EnumSet<OrtProvider> providers = OrtEnvironment.getAvailableProviders();
-        System.out.println("onnxruntime " + OrtEnvironment.class.getPackage().getImplementationVersion()
-                + ", providers " + providers);
+        System.out.println("providers " + providers);
         if (!providers.contains(OrtProvider.DIRECT_ML)) fail("the DirectML provider is missing from this build");
         if (model == null) return;
 

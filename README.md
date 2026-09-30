@@ -59,6 +59,8 @@ Dynamic dimensions are set to 2, float inputs are random, int64 inputs are 4 and
 
 Run the `build` workflow by hand (Actions, build, Run workflow) with an ONNX Runtime version and a Visual Studio version. It takes one to three hours on a hosted runner and publishes release `v<version>`. To rebuild a version, delete its release and tag first.
 
+The workflow has three jobs: `build` compiles and uploads the zip as an artifact, `smoke` tests that zip and `publish` releases it after checking its SHA-256 again. When `smoke` or `publish` fails, fix the cause and use Re-run failed jobs: the compiled zip is reused instead of building again.
+
 - Visual Studio 2026 (the `windows-2025` runner) is the default. ONNX Runtime's own CI compiles with Visual Studio 2022, so choose 2022 (the `windows-2022` runner) if 2026 fails to compile.
 - JDK 21 builds the Java binding: the Gradle wrapper that ONNX Runtime pins (8.7) runs on JDK 21 at most. The jar targets Java 8 bytecode, so it runs on any newer JDK.
 - The official DirectML packages (`onnxruntime-directml` on PyPI, `Microsoft.ML.OnnxRuntime.DirectML` on NuGet) stop at 1.24.4, because DirectML moved to sustained engineering. The DirectML provider is still in the ONNX Runtime source and still receives fixes, which only a source build like this one delivers.
