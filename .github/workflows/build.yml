@@ -1,0 +1,159 @@
+# Builds ONNX Runtime from source with the DirectML provider and the Java binding, and publishes it as the
+# GitHub release v<version>. See README.md for the layout of the zip and how to load it.
+# - Run it by hand (Actions, build, Run workflow). A full build takes one to three hours.
+# - An existing release is never replaced, because users pin the SHA-256 of the zip. Delete the release and
+#   its tag first to rebuild the same version.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: ONNX Runtime release to build, without the leading v
+        required: true
+        default: 1.30.0
+      visual_studio:
+        description: Visual Studio version. ONNX Runtime's own CI builds with 2022, so use it if 2026 fails to compile
+        type: choice
+        options: ['2026', '2022']
+        default: '2026'
+
+permissions:
+  contents: write                  # gh release create
+
+jobs:
+  windows-x64:
+    # windows-2025 has Visual Studio 2026, windows-2022 has Visual Studio 2022.
+    runs-on: ${{ inputs.visual_studio == '2022' && 'windows-2022' || 'windows-2025' }}
+    timeout-minutes: 360
+    env:
+      ORT_VERSION: ${{ inputs.version }}
+      RELEASE_TAG: v${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      SRC: onnxruntime
+      BUILD_DIR: onnxruntime/build/Windows/Release
+      CMAKE_GENERATOR_NAME: ${{ inputs.visual_studio == '2022' && 'Visual Studio 17 2022' || 'Visual Studio 18 2026' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Stop if the release exists
+        run: |
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release $env:RELEASE_TAG exists; delete it and its tag first to rebuild" }
+          $global:LASTEXITCODE = 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: microsoft/onnxruntime
+          ref: v${{ inputs.version }}
+          path: ${{ env.SRC }}
+          submodules: recursive
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      # The Java binding compiles with the Gradle wrapper pinned in ONNX Runtime (8.7 as of 1.30). Its build script needs
+      # JDK 17 or newer, and Gradle 8.7 runs on JDK 21 at most, so 21 is the newest usable JDK. The jar targets Java 8
+      # bytecode whichever JDK builds it.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Unit tests are off because they double the build time; the smoke test below covers loading and running.
+      - name: Build
+        working-directory: ${{ env.SRC }}
+        run: |
+          python tools\ci_build\build.py --build_dir build\Windows --config Release --parallel --skip_tests `
+            --build_shared_lib --build_java --use_dml --compile_no_warning_as_error `
+            --cmake_generator $env:CMAKE_GENERATOR_NAME --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { throw "build.py failed with exit code $LASTEXITCODE" }
+
+      - name: Package
+        id: pkg
+        run: |
+          $name = "onnxruntime-dml-java-$env:ORT_VERSION-win-x64"
+          $out = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force "$out/native", "$out/licenses" | Out-Null
+
+          $jar = Get-ChildItem "$env:BUILD_DIR/java/build/libs/onnxruntime*.jar" |
+            Where-Object { $_.Name -notmatch 'sources|javadoc' } | Select-Object -First 1
+          if (-not $jar) { throw 'Java jar not found' }
+          $natives = @(Get-ChildItem "$env:BUILD_DIR/java/native-lib/ai/onnxruntime/native/win-x64/*.dll") +
+                     @(Get-ChildItem "$env:BUILD_DIR/java/native-jni/ai/onnxruntime/native/win-x64/*.dll")
+          $dml = Get-ChildItem "$env:SRC/build/Windows/packages" -Recurse -Filter DirectML.dll |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]x64-win[\\/]' } | Select-Object -First 1
+          if (-not $dml) { throw 'DirectML.dll (x64) not found in the restored NuGet packages' }
+          foreach ($need in 'onnxruntime.dll', 'onnxruntime4j_jni.dll') {
+            if (-not ($natives | Where-Object Name -eq $need)) { throw "$need not found" }
+          }
+          $natives + $dml | Copy-Item -Destination "$out/native"
+
+          # The native libraries live in native/, so the copies inside the jar are removed rather than shipped twice.
+          $jarOut = "$out/onnxruntime-$env:ORT_VERSION.jar"
+          python -c "import sys, zipfile; src, dst = sys.argv[1:]; zin = zipfile.ZipFile(src); zout = zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED); [zout.writestr(i, zin.read(i)) for i in zin.infolist() if not i.filename.startswith('ai/onnxruntime/native/')]; zout.close()" $jar.FullName $jarOut
+          if ($LASTEXITCODE -ne 0) { throw 'repacking the jar failed' }
+
+          Copy-Item "$env:SRC/LICENSE" "$out/licenses/onnxruntime-LICENSE.txt"
+          Copy-Item "$env:SRC/ThirdPartyNotices.txt" "$out/licenses/onnxruntime-ThirdPartyNotices.txt"
+          $dmlPkg = $dml.Directory.Parent.Parent
+          $dmlTexts = Get-ChildItem $dmlPkg.FullName -File -Filter *.txt
+          if (-not $dmlTexts) { throw "No license text found in $($dmlPkg.Name)" }
+          $dmlTexts | ForEach-Object { Copy-Item $_.FullName "$out/licenses/DirectML-$($_.Name)" }
+          @("ONNX Runtime: v$env:ORT_VERSION", "DirectML package: $($dmlPkg.Name)", "Compiler: $env:CMAKE_GENERATOR_NAME") |
+            Set-Content "$out/VERSIONS.txt"
+
+          "out=$out" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "jar=$jarOut" >> $env:GITHUB_OUTPUT
+          "dml=$($dmlPkg.Name)" >> $env:GITHUB_OUTPUT
+
+      # The runner has no GPU, so a DirectML failure is reported without failing; the provider must still be listed
+      # and the CPU run must work. The DirectML run itself is checked on a machine with a GPU, see README.md.
+      - name: Smoke test
+        run: |
+          python -m pip install --quiet onnx
+          $model = Join-Path $env:RUNNER_TEMP 'smoke.onnx'
+          python -c "import sys, numpy as np, onnx; from onnx import helper as h, TensorProto as T, numpy_helper as nh; w = nh.from_array(np.random.default_rng(0).standard_normal((16, 8)).astype(np.float32), 'W'); g = h.make_graph([h.make_node('MatMul', ['X', 'W'], ['Y']), h.make_node('Softmax', ['Y'], ['Z'], axis=-1)], 'smoke', [h.make_tensor_value_info('X', T.FLOAT, ['B', 16])], [h.make_tensor_value_info('Z', T.FLOAT, ['B', 8])], [w]); m = h.make_model(g, opset_imports=[h.make_opsetid('', 17)]); onnx.checker.check_model(m); onnx.save(m, sys.argv[1])" $model
+          if ($LASTEXITCODE -ne 0) { throw 'creating the smoke model failed' }
+          java "-Donnxruntime.native.path=${{ steps.pkg.outputs.out }}/native" -cp "${{ steps.pkg.outputs.jar }}" `
+            smoke/OrtSmoke.java $model --dml-optional
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed with exit code $LASTEXITCODE" }
+
+      - name: Checksums and zip
+        id: zip
+        run: |
+          $out = '${{ steps.pkg.outputs.out }}'
+          Get-ChildItem $out -Recurse -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $([IO.Path]::GetRelativePath($out, $_.FullName).Replace('\', '/'))"
+          } | Set-Content -Encoding ascii "$out/SHA256SUMS.txt"
+          Get-Content "$out/SHA256SUMS.txt"
+          $zip = Join-Path $env:RUNNER_TEMP '${{ steps.pkg.outputs.name }}.zip'
+          Compress-Archive -Path "$out/*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "zip SHA-256: $hash"
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "hash=$hash" >> $env:GITHUB_OUTPUT
+
+      # archive: false uploads the zip as it is instead of zipping it again.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.zip.outputs.zip }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Publish release
+        run: |
+          $notes = @(
+            "ONNX Runtime v$env:ORT_VERSION with the DirectML provider (${{ steps.pkg.outputs.dml }}) and the Java binding, Windows x64, compiled with $env:CMAKE_GENERATOR_NAME."
+            "Built from microsoft/onnxruntime v$env:ORT_VERSION by $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            ''
+            'zip SHA-256: ${{ steps.zip.outputs.hash }}'
+          ) -join "`n"
+          gh release create $env:RELEASE_TAG '${{ steps.zip.outputs.zip }}' --target $env:GITHUB_SHA `
+            --title "ONNX Runtime $env:ORT_VERSION with DirectML" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }

@@ -1,0 +1,4 @@
+# Local test output: unzipped releases and models used with the smoke test.
+/onnxruntime-dml-java-*/
+*.zip
+*.onnx
